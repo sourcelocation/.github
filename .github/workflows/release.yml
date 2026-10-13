@@ -37,8 +37,18 @@ jobs:
       tag: ${{ steps.release.outputs.tag_name }}
       sha: ${{ steps.release.outputs.sha }}
     steps:
+      # The app's token, not GITHUB_TOKEN, so CI runs on the release pull request: GitHub starts no
+      # workflows for what GITHUB_TOKEN creates. The caller holds RELEASE_APP_CLIENT_ID (a variable)
+      # and RELEASE_APP_PRIVATE_KEY (a secret) of the account's release app.
+      - id: token
+        uses: actions/create-github-app-token@v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - id: release
         uses: googleapis/release-please-action@v5.0.0
+        with:
+          token: ${{ steps.token.outputs.token }}
 
   images:
     name: Image ${{ matrix.image }}
@@ -68,6 +78,9 @@ jobs:
           target: ${{ matrix.target }}
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.app }}-${{ matrix.image }}:${{ needs.release-please.outputs.tag }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.release-please.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.release-please.outputs.sha }}
           build-args: |
             VERSION=${{ needs.release-please.outputs.tag }}
             RELEASE=${{ needs.release-please.outputs.tag }}
