@@ -1,0 +1,105 @@
+name: Release
+
+# Every repository's release, called from its own .github/workflows/release.yml on each push to its
+# default branch. release-please keeps a pull request open with the next version and changelog, read
+# from Conventional Commits; merging it tags the version and publishes the GitHub release. With
+# `app`, that release then builds ghcr.io/<owner>/<app>-<image>:<tag> for each of `images` and
+# commits the new tags to ops (apps/<app>), where Flux deploys them.
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: The app's name in ops and its images' prefix. Empty releases without images.
+        type: string
+        default: ""
+      images:
+        description: 'The images, as JSON: [{"image": "api", "file": "server/Dockerfile", "target": ""}]'
+        type: string
+        default: "[]"
+    outputs:
+      release_created:
+        value: ${{ jobs.release-please.outputs.release_created }}
+      tag:
+        value: ${{ jobs.release-please.outputs.tag }}
+      sha:
+        value: ${{ jobs.release-please.outputs.sha }}
+
+jobs:
+  release-please:
+    name: Release pull request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v5.0.0
+
+  images:
+    name: Image ${{ matrix.image }}
+    if: needs.release-please.outputs.release_created == 'true' && inputs.app != ''
+    needs: release-please
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include: ${{ fromJSON(inputs.images) }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.app }}-${{ matrix.image }}:${{ needs.release-please.outputs.tag }}
+          build-args: |
+            VERSION=${{ needs.release-please.outputs.tag }}
+            RELEASE=${{ needs.release-please.outputs.tag }}
+            SENTRY_DSN=${{ vars.WEB_SENTRY_DSN }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.app }}-${{ matrix.image }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ inputs.app }}-${{ matrix.image }}:buildcache,mode=max
+
+  deploy:
+    name: Deploy through ops
+    needs: [release-please, images]
+    runs-on: ubuntu-latest
+    # The token that writes to ops is the caller's production environment secret.
+    environment: production
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/ops
+          token: ${{ secrets.OPS_TOKEN }}
+      # Only the image tags change, and a race with another app's deploy rebases.
+      - env:
+          APP: ${{ inputs.app }}
+          IMAGES: ${{ inputs.images }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+          SHA: ${{ needs.release-please.outputs.sha }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          for image in $(jq -r '.[].image' <<<"$IMAGES"); do
+            yq -i "(.images[] | select(.name == \"ghcr.io/$OWNER/$APP-$image\") | .newTag) = \"$TAG\"" "apps/$APP/kustomization.yaml"
+          done
+          git config user.name "$APP-release"
+          git config user.email "$APP-release@users.noreply.github.com"
+          git commit -am "deploy $APP $TAG" -m "From $GITHUB_REPOSITORY@$SHA"
+          for _ in 1 2 3; do git push && exit 0; git pull --rebase; done
+          exit 1
